@@ -2,7 +2,7 @@ const express = require('express')
 const cors = require('cors')
 const app = express()
 require('dotenv').config()
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const port = process.env.PORT || 3000
 
 const stripe = require('stripe')(process.env.STRIPE_SECRET);
@@ -104,6 +104,21 @@ async function run() {
       res.send(result);
     })
 
+    app.get('/lessondetails/:id', verifyFirebaseToken, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const lesson = await lessonsCollection.findOne(query);
+
+      // Fetch the user to check premium
+      const user = await usersCollection.findOne({ uid: req.user.uid });
+
+      res.send({
+        lesson,
+        isPremiumUser: user?.isPremium || false,
+      });
+    });
+
+
     // Users API
     app.get('/users', async (req, res) => {
       const cursor = usersCollection.find();
@@ -118,6 +133,14 @@ async function run() {
         isPremium: user?.isPremium || false,
       });
     });
+
+    // GET user by email
+    app.get('/users/:email', async (req, res) => {
+      const email = req.params.email;
+      const user = await usersCollection.findOne({ email });
+      res.send(user);
+    });
+
 
 
 
@@ -139,7 +162,7 @@ async function run() {
           message: 'User already has Premium access',
         });
       }
-      
+
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ['card'],
         mode: 'payment',
