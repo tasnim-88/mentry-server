@@ -104,12 +104,39 @@ async function run() {
     //   res.send(result);
     // })
 
+    // app.get('/lessons', async (req, res) => {
+    //   const { uid } = req.query;
+    //   const query = uid ? { uid } : {};
+    //   const lessons = await lessonsCollection.find(query).toArray();
+    //   res.send(lessons);
+    // });
+
     app.get('/lessons', async (req, res) => {
-      const { uid } = req.query;
-      const query = uid ? { uid } : {};
-      const lessons = await lessonsCollection.find(query).toArray();
-      res.send(lessons);
+      try {
+        const { uid } = req.query;
+
+        const query = {
+          'metadata.privacy': { $ne: 'Private' },
+          'metadata.visibility': { $ne: 'Hidden' },
+        };
+
+        // If profile page → only that user's lessons
+        if (uid) {
+          query['author.uid'] = uid;
+        }
+
+        const lessons = await lessonsCollection
+          .find(query)
+          .sort({ 'metadata.createdDate': -1 })
+          .toArray();
+
+        res.send(lessons);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: 'Failed to fetch lessons' });
+      }
     });
+
 
 
 
@@ -262,8 +289,40 @@ async function run() {
 
       res.send({
         isPremium: user?.isPremium || false,
+        totalLessons: user?.totalLessons || 0,
+        savedLessons: user?.savedLessons || 0,
       });
     });
+
+    // UPDATE USER PROFILE (name / photo)
+    app.patch('/users/me', verifyFirebaseToken, async (req, res) => {
+      const { displayName, photoURL } = req.body;
+
+      const update = {};
+      if (displayName) update.displayName = displayName;
+      if (photoURL) update.photoURL = photoURL;
+
+      // Update users collection
+      await usersCollection.updateOne(
+        { uid: req.user.uid },
+        { $set: update },
+        { upsert: true }
+      );
+
+      // OPTIONAL: sync all lessons authored by user
+      await lessonsCollection.updateMany(
+        { 'author.uid': req.user.uid },
+        {
+          $set: {
+            'author.name': displayName,
+            'author.profileImage': photoURL,
+          },
+        }
+      );
+
+      res.send({ success: true });
+    });
+
 
     // GET user by email
     app.get('/users/:email', async (req, res) => {
