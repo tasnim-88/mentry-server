@@ -179,6 +179,75 @@ async function run() {
       }
     });
 
+    // My lessons
+    app.get('/my-lessons', verifyFirebaseToken, async (req, res) => {
+      const lessons = await lessonsCollection
+        .find({ "author.uid": req.user.uid })
+        .sort({ "metadata.createdDate": -1 })
+        .toArray();
+
+      res.send(lessons);
+    });
+
+    app.patch('/lessons/:id', verifyFirebaseToken, async (req, res) => {
+      const { id } = req.params;
+      const updates = req.body;
+
+      const lesson = await lessonsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!lesson) {
+        return res.status(404).send({ message: 'Lesson not found' });
+      }
+
+      // 🔒 Ownership check
+      if (lesson.author.uid !== req.user.uid) {
+        return res.status(403).send({ message: 'Forbidden' });
+      }
+
+      // 🔒 Premium enforcement
+      const user = await usersCollection.findOne({ uid: req.user.uid });
+      if (updates?.metadata?.accessLevel === 'Premium' && !user?.isPremium) {
+        return res.status(403).send({ message: 'Premium required' });
+      }
+
+      updates.metadata.lastUpdated = new Date().toISOString();
+
+      await lessonsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updates }
+      );
+
+      res.send({ success: true });
+    });
+
+    app.delete('/lessons/:id', verifyFirebaseToken, async (req, res) => {
+      const { id } = req.params;
+
+      const lesson = await lessonsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!lesson) {
+        return res.status(404).send({ message: 'Lesson not found' });
+      }
+
+      if (lesson.author.uid !== req.user.uid) {
+        return res.status(403).send({ message: 'Forbidden' });
+      }
+
+      await lessonsCollection.deleteOne({ _id: new ObjectId(id) });
+
+      // 🔻 Decrement total lessons
+      await usersCollection.updateOne(
+        { uid: req.user.uid },
+        { $inc: { totalLessons: -1 } }
+      );
+
+      res.send({ success: true });
+    });
+
 
 
     // Users API
