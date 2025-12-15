@@ -98,25 +98,87 @@ async function run() {
     lessonsCollection = db.collection("lessons");
 
     // Lessons API
+    // app.get('/lessons', async (req, res) => {
+    //   const cursor = lessonsCollection.find();
+    //   const result = await cursor.toArray();
+    //   res.send(result);
+    // })
+
     app.get('/lessons', async (req, res) => {
-      const cursor = lessonsCollection.find();
-      const result = await cursor.toArray();
-      res.send(result);
-    })
+      const { uid } = req.query;
+      const query = uid ? { uid } : {};
+      const lessons = await lessonsCollection.find(query).toArray();
+      res.send(lessons);
+    });
+
+
+
 
     app.get('/lessondetails/:id', verifyFirebaseToken, async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const lesson = await lessonsCollection.findOne(query);
+      const lessonId = req.params.id;
 
-      // Fetch the user to check premium
+      const lesson = await lessonsCollection.findOne({
+        _id: new ObjectId(lessonId),
+      });
+
+      if (!lesson) {
+        return res.status(404).send({ message: 'Lesson not found' });
+      }
+
       const user = await usersCollection.findOne({ uid: req.user.uid });
 
+      const isAuthor = lesson.author?.uid === req.user.uid;
+      const isPremiumUser = user?.isPremium === true;
+
+      const { privacy, accessLevel } = lesson.metadata;
+
+      // 🔒 Private lesson → author only
+      if (privacy === 'Private' && !isAuthor) {
+        return res.status(403).send({ message: 'This lesson is private' });
+      }
+
+      // 💎 Premium lesson → premium users only
+      if (accessLevel === 'Premium' && !isPremiumUser) {
+        return res.status(403).send({ message: 'Premium access required' });
+      }
+
+      // ✅ Access granted
       res.send({
         lesson,
-        isPremiumUser: user?.isPremium || false,
+        isPremiumUser,
+        isAuthor,
       });
     });
+
+
+    app.post('/lessons', verifyFirebaseToken, async (req, res) => {
+      try {
+        const lesson = req.body;
+
+        // 🔒 Enforce author from Firebase token
+        lesson.author.uid = req.user.uid;
+        lesson.author.email = req.user.email;
+
+        // 1️⃣ Insert lesson
+        const result = await lessonsCollection.insertOne(lesson);
+
+        // 2️⃣ Increment user's total lessons
+        await usersCollection.updateOne(
+          { uid: req.user.uid },
+          { $inc: { totalLessons: 1 } },
+          { upsert: true }
+        );
+
+        res.send({
+          success: true,
+          lessonId: result.insertedId,
+        });
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: 'Failed to create lesson' });
+      }
+    });
+
 
 
     // Users API
