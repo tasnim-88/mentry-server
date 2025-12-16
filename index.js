@@ -88,6 +88,8 @@ const client = new MongoClient(uri, {
   }
 });
 
+
+
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
@@ -96,6 +98,8 @@ async function run() {
     const db = client.db("mentry");
     usersCollection = db.collection("users");
     lessonsCollection = db.collection("lessons");
+    const lessonsReportsCollection = db.collection('lessonsReports');
+    const commentsCollection = db.collection('comments');
 
     // Lessons API
     // app.get('/lessons', async (req, res) => {
@@ -139,11 +143,12 @@ async function run() {
 
 
 
-
-
+    // 4. LESSON DETAILS Endpoint Refinement
     app.get('/lessondetails/:id', verifyFirebaseToken, async (req, res) => {
       const lessonId = req.params.id;
+      const userId = req.user.uid; // Get the ID of the currently logged-in user
 
+      // Fetch Lesson
       const lesson = await lessonsCollection.findOne({
         _id: new ObjectId(lessonId),
       });
@@ -152,10 +157,15 @@ async function run() {
         return res.status(404).send({ message: 'Lesson not found' });
       }
 
-      const user = await usersCollection.findOne({ uid: req.user.uid });
+      // Fetch User
+      const user = await usersCollection.findOne({ uid: userId });
 
-      const isAuthor = lesson.author?.uid === req.user.uid;
+      const isAuthor = lesson.author?.uid === userId;
       const isPremiumUser = user?.isPremium === true;
+
+      // Check Engagement Status
+      const userHasLiked = lesson.stats?.likesArray?.includes(userId) || false;
+      const userHasFavorited = user?.favoritesArray?.includes(lessonId) || false; // Check user's saved array
 
       const { privacy, accessLevel } = lesson.metadata;
 
@@ -165,7 +175,7 @@ async function run() {
       }
 
       // 💎 Premium lesson → premium users only
-      if (accessLevel === 'Premium' && !isPremiumUser) {
+      if (accessLevel === 'Premium' && !isPremiumUser && !isAuthor) {
         return res.status(403).send({ message: 'Premium access required' });
       }
 
@@ -174,8 +184,12 @@ async function run() {
         lesson,
         isPremiumUser,
         isAuthor,
+        // RETURN THESE FLAGS TO THE CLIENT
+        userHasLiked,
+        userHasFavorited
       });
     });
+
 
 
     app.post('/lessons', verifyFirebaseToken, async (req, res) => {
@@ -276,6 +290,337 @@ async function run() {
     });
 
 
+    // GET similar lessons
+    app.get('/similar-lessons/:id', async (req, res) => {
+      const currentLessonId = req.params.id;
+      const { category, tone } = req.query; // Expect category and tone as query params
+
+      if (!category && !tone) {
+        return res.send([]); // Return empty if no criteria provided
+      }
+
+      const query = {
+        _id: { $ne: new ObjectId(currentLessonId) }, // Exclude the current lesson
+        'metadata.privacy': { $ne: 'Private' },
+        'metadata.visibility': { $ne: 'Hidden' },
+        $or: [
+          { 'lessonInfo.category': category },
+          { 'lessonInfo.tone': tone },
+        ],
+      };
+
+      try {
+        const similarLessons = await lessonsCollection
+          .find(query)
+          .limit(6) // Display at most 6 cards
+          .toArray();
+
+        res.send(similarLessons);
+      } catch (error) {
+        console.error("Error fetching similar lessons:", error);
+        res.status(500).send({ message: 'Failed to fetch similar lessons' });
+      }
+    });
+
+
+
+    // 1. CORRECTED ENDPOINT: View Count Increment
+    // app.patch('/lesson/view/:id', async (req, res) => {
+    //   try {
+    //     const lessonId = req.params.id;
+    //     const userIdentifier = getUserIdentifier(req); // Use UID or IP
+
+    //     // 1. Check if the user/IP has already viewed this lesson recently
+    //     // The 'stats.viewedBy' array stores the identifier for tracking unique views.
+    //     const lesson = await lessonsCollection.findOne(
+    //       { _id: new ObjectId(lessonId), 'stats.viewedBy': userIdentifier },
+    //       { projection: { 'stats.viewedBy': 1 } }
+    //     );
+
+    //     if (lesson) {
+    //       // Already viewed, do nothing.
+    //       return res.status(200).send({ success: false, message: 'View already counted' });
+    //     }
+
+    //     // 2. If not viewed, increment the count and add the identifier to the array
+    //     await lessonsCollection.updateOne(
+    //       { _id: new ObjectId(lessonId) },
+    //       {
+    //         $inc: { 'stats.views': 1 },
+    //         $addToSet: { 'stats.viewedBy': userIdentifier }
+    //       }
+    //     );
+
+    //     // OPTIONAL: If using IP addresses for tracking, you might want to remove old IPs 
+    //     // periodically to reset the unique view counter over time.
+
+    //     res.send({ success: true, message: 'View count incremented' });
+
+    //   } catch (error) {
+    //     console.error("Error incrementing view count:", error);
+    //     res.status(500).send({ message: 'Failed to increment view count' });
+    //   }
+    // });
+
+    // 2. CONFIRMED ENDPOINT: Like / Unlike Toggle
+    app.post('/lesson/:id/like', verifyFirebaseToken, async (req, res) => {
+      try {
+        const lessonId = req.params.id;
+        const userId = req.user.uid;
+        const { action } = req.body; // 'like' or 'unlike'
+
+        if (action === 'like') {
+          // Use $addToSet to ensure userId is only added once
+          const result = await lessonsCollection.updateOne(
+            { _id: new ObjectId(lessonId), 'stats.likesArray': { $ne: userId } },
+            {
+              $addToSet: { 'stats.likesArray': userId },
+              $inc: { 'stats.likes': 1 }
+            }
+          );
+          // Only report success if a modification happened (i.e., it wasn't already liked)
+          return res.send({ success: result.modifiedCount > 0, message: 'Lesson liked' });
+        }
+
+        if (action === 'unlike') {
+          // Use $pull to remove userId if it exists
+          const result = await lessonsCollection.updateOne(
+            { _id: new ObjectId(lessonId), 'stats.likesArray': userId },
+            {
+              $pull: { 'stats.likesArray': userId },
+              $inc: { 'stats.likes': -1 }
+            }
+          );
+          // Only report success if a modification happened (i.e., it was previously liked)
+          return res.send({ success: result.modifiedCount > 0, message: 'Lesson unliked' });
+        }
+
+        res.status(400).send({ message: 'Invalid action specified' });
+      } catch (error) {
+        console.error("Error toggling like:", error);
+        res.status(500).send({ message: 'Failed to process like action' });
+      }
+    });
+
+
+    // 3. CONFIRMED ENDPOINT: Favorite / Unfavorite Toggle
+    app.post('/lesson/:id/favorite', verifyFirebaseToken, async (req, res) => {
+      try {
+        const lessonId = req.params.id;
+        const userId = req.user.uid;
+        const { action } = req.body; // 'favorite' or 'unfavorite'
+
+        const isFavoriting = action === 'favorite';
+        const operator = isFavoriting ? '$addToSet' : '$pull';
+        const increment = isFavoriting ? 1 : -1;
+
+        // 1. Update User document (for saved lessons list and count)
+        const userUpdateResult = await usersCollection.updateOne(
+          { uid: userId },
+          {
+            [operator]: { favoritesArray: lessonId },
+            $inc: { savedLessons: increment }
+          },
+          { upsert: true }
+        );
+
+        // If the user's document was modified (i.e., the state changed), update the lesson count
+        if (userUpdateResult.modifiedCount > 0 || userUpdateResult.upsertedCount > 0) {
+          // 2. Update Lesson document (for favorite count)
+          await lessonsCollection.updateOne(
+            { _id: new ObjectId(lessonId) },
+            { $inc: { 'stats.favorites': increment } }
+          );
+        }
+
+        res.send({ success: true, message: `Lesson ${action}d` });
+
+      } catch (error) {
+        console.error("Error toggling favorite:", error);
+        res.status(500).send({ message: 'Failed to process favorite action' });
+      }
+    });
+
+    // GET Favorite Lessons for the current user
+    app.get('/my-favorites', verifyFirebaseToken, async (req, res) => {
+      try {
+        const userId = req.user.uid;
+        // ⭐️ NEW: Read optional filter parameters from query
+        const { category, tone } = req.query;
+
+        // 1. Fetch the logged-in user's document to get the favoritesArray
+        const user = await usersCollection.findOne(
+          { uid: userId },
+          { projection: { favoritesArray: 1 } }
+        );
+
+        const favoriteLessonIds = user?.favoritesArray || [];
+
+        if (favoriteLessonIds.length === 0) {
+          return res.send([]);
+        }
+
+        // Convert the string IDs in the array to MongoDB's ObjectId type
+        const objectIds = favoriteLessonIds
+          .map(id => {
+            try {
+              return new ObjectId(id);
+            } catch (e) {
+              return null;
+            }
+          })
+          .filter(id => id !== null);
+
+        // 2. ⭐️ NEW: Build the query object for lessons
+        const lessonQuery = {
+          _id: { $in: objectIds },
+        };
+
+        if (category && category !== 'Filter by Category') {
+          lessonQuery['lessonInfo.category'] = category;
+        }
+
+        if (tone && tone !== 'Filter by Tone') {
+          lessonQuery['lessonInfo.tone'] = tone;
+        }
+
+        // 3. Fetch the full lesson documents using the constructed query
+        const favoriteLessons = await lessonsCollection.find(lessonQuery)
+          .sort({ "metadata.createdDate": -1 })
+          .toArray();
+
+        res.send(favoriteLessons);
+      } catch (error) {
+        console.error("Error fetching favorite lessons:", error);
+        res.status(500).send({ message: 'Failed to fetch favorite lessons' });
+      }
+    });
+
+
+    // POST /lesson/:id/report
+    app.post('/lesson/:id/report', verifyFirebaseToken, async (req, res) => {
+      try {
+        const { id: lessonId } = req.params;
+        const { reason } = req.body; // Reason from the client modal
+
+        // Data from the verifyFirebaseToken middleware
+        const reporterUserId = req.user.uid;
+        const reportedUserEmail = req.user.email;
+
+        if (!reason || typeof reason !== 'string' || reason.length < 5) {
+          return res.status(400).send({ message: 'Invalid or missing reason for report.' });
+        }
+
+        // Optional: Check if the lesson ID is valid before proceeding
+        let objectIdLessonId;
+        try {
+          objectIdLessonId = new ObjectId(lessonId);
+        } catch (e) {
+          return res.status(400).send({ message: 'Invalid Lesson ID format.' });
+        }
+
+        // ⭐️ Create the report document
+        const reportDoc = {
+          lessonId: objectIdLessonId,
+          reporterUserId: reporterUserId,
+          reportedUserEmail: reportedUserEmail,
+          reason: reason,
+          timestamp: new Date(),
+          status: 'Pending Review' // Default status
+        };
+
+        const result = await lessonsReportsCollection.insertOne(reportDoc);
+
+        if (result.acknowledged) {
+          res.status(201).send({ message: 'Lesson reported successfully.', reportId: result.insertedId });
+        } else {
+          res.status(500).send({ message: 'Failed to save report.' });
+        }
+
+      } catch (error) {
+        console.error("Error submitting lesson report:", error);
+        res.status(500).send({ message: 'Internal server error while reporting lesson.' });
+      }
+    });
+
+    // ⭐️ 2. GET Comments for a Lesson
+    app.get('/lesson/:id/comments', async (req, res) => {
+      try {
+        const lessonId = req.params.id;
+        let objectIdLessonId;
+        try {
+          objectIdLessonId = new ObjectId(lessonId);
+        } catch (e) {
+          return res.status(400).send({ message: 'Invalid Lesson ID format.' });
+        }
+
+        // Find all comments for this lesson, sorted by creation date (newest first)
+        const lessonComments = await commentsCollection
+          .find({ lessonId: objectIdLessonId })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send({ comments: lessonComments });
+      } catch (error) {
+        console.error("Error fetching comments:", error);
+        res.status(500).send({ message: 'Failed to fetch comments' });
+      }
+    });
+
+    // ⭐️ 3. POST New Comment to a Lesson
+    app.post('/lesson/:id/comments', verifyFirebaseToken, async (req, res) => {
+      try {
+        const lessonId = req.params.id;
+        const userId = req.user.uid;
+        const { content } = req.body; // The comment text from the client
+
+        if (!content || typeof content !== 'string' || content.trim().length < 1) {
+          return res.status(400).send({ message: 'Comment content cannot be empty.' });
+        }
+
+        let objectIdLessonId;
+        try {
+          objectIdLessonId = new ObjectId(lessonId);
+        } catch (e) {
+          return res.status(400).send({ message: 'Invalid Lesson ID format.' });
+        }
+
+        // Fetch the user's profile to get their name and photo for the comment
+        const userProfile = await usersCollection.findOne(
+          { uid: userId },
+          { projection: { displayName: 1, photoURL: 1 } }
+        );
+
+        // Construct the comment document
+        const newComment = {
+          lessonId: objectIdLessonId, // Link to the lesson
+          content: content.trim(),
+          author: {
+            uid: userId,
+            name: userProfile?.displayName || req.user.email,
+            profileImage: userProfile?.photoURL || '',
+          },
+          createdAt: new Date(),
+        };
+
+        const result = await commentsCollection.insertOne(newComment);
+
+        if (result.acknowledged) {
+          res.status(201).send({
+            message: 'Comment posted successfully',
+            commentId: result.insertedId,
+            // Optionally send back the full document (including timestamp)
+            newComment: newComment
+          });
+        } else {
+          res.status(500).send({ message: 'Failed to save comment.' });
+        }
+
+      } catch (error) {
+        console.error("Error posting comment:", error);
+        res.status(500).send({ message: 'Internal server error while posting comment.' });
+      }
+    });
 
     // Users API
     app.get('/users', async (req, res) => {
@@ -309,6 +654,7 @@ async function run() {
         { upsert: true }
       );
 
+
       // OPTIONAL: sync all lessons authored by user
       await lessonsCollection.updateMany(
         { 'author.uid': req.user.uid },
@@ -321,6 +667,52 @@ async function run() {
       );
 
       res.send({ success: true });
+    });
+
+    // GET user profile by UID (e.g., for a public profile page)
+    app.get('/users/:authorUid', async (req, res) => {
+      try {
+        const authorUid = req.params.authorUid;
+
+        // 1. Fetch the user's document using the UID from the URL
+        const user = await usersCollection.findOne(
+          { uid: authorUid },
+          {
+            // Projection: Only return necessary public data
+            projection: {
+              _id: 0, // Exclude Mongo ID
+              uid: 1,
+              displayName: 1,
+              email: 1, // You might choose to hide the email
+              photoURL: 1,
+              totalLessons: 1,
+              savedLessons: 1,
+              isPremium: 1, // Useful for displaying a badge
+            },
+          }
+        );
+
+        if (!user) {
+          return res.status(404).send({ message: 'User not found' });
+        }
+
+        // You might want to filter out sensitive fields before sending
+        const publicProfile = {
+          uid: user.uid,
+          displayName: user.displayName || 'Anonymous User',
+          photoURL: user.photoURL || '',
+          totalLessons: user.totalLessons || 0,
+          savedLessons: user.savedLessons || 0,
+          isPremium: user.isPremium || false, // Display a "Premium" badge if they have it
+          // Intentionally omitting email for public view
+        };
+
+        res.send(publicProfile);
+
+      } catch (error) {
+        console.error('Error fetching user profile:', error);
+        res.status(500).send({ message: 'Failed to fetch user profile' });
+      }
     });
 
 
