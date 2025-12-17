@@ -141,8 +141,6 @@ async function run() {
       }
     });
 
-
-
     // 4. LESSON DETAILS Endpoint Refinement
     app.get('/lessondetails/:id', verifyFirebaseToken, async (req, res) => {
       const lessonId = req.params.id;
@@ -291,6 +289,37 @@ async function run() {
 
 
     // GET similar lessons
+    // app.get('/similar-lessons/:id', async (req, res) => {
+    //   const currentLessonId = req.params.id;
+    //   const { category, tone } = req.query; // Expect category and tone as query params
+
+    //   if (!category && !tone) {
+    //     return res.send([]); // Return empty if no criteria provided
+    //   }
+
+    //   const query = {
+    //     _id: { $ne: new ObjectId(currentLessonId) }, // Exclude the current lesson
+    //     'metadata.privacy': { $ne: 'Private' },
+    //     'metadata.visibility': { $ne: 'Hidden' },
+    //     $or: [
+    //       { 'lessonInfo.category': category },
+    //       { 'lessonInfo.tone': tone },
+    //     ],
+    //   };
+
+    //   try {
+    //     const similarLessons = await lessonsCollection
+    //       .find(query)
+    //       .limit(6) // Display at most 6 cards
+    //       .toArray();
+
+    //     res.send(similarLessons);
+    //   } catch (error) {
+    //     console.error("Error fetching similar lessons:", error);
+    //     res.status(500).send({ message: 'Failed to fetch similar lessons' });
+    //   }
+    // });
+
     app.get('/similar-lessons/:id', async (req, res) => {
       const currentLessonId = req.params.id;
       const { category, tone } = req.query; // Expect category and tone as query params
@@ -299,10 +328,22 @@ async function run() {
         return res.send([]); // Return empty if no criteria provided
       }
 
+      // Define the list of access states that should NOT be visible publicly
+      const EXCLUDED_VISIBILITY_STATES = ['Private', 'Hidden']; // Assuming 'Private' means Premium
+
       const query = {
-        _id: { $ne: new ObjectId(currentLessonId) }, // Exclude the current lesson
-        'metadata.privacy': { $ne: 'Private' },
-        'metadata.visibility': { $ne: 'Hidden' },
+        // 1. Exclusion: Exclude the current lesson
+        _id: { $ne: new ObjectId(currentLessonId) },
+
+        // 2. Access Control: Ensure the lesson is PUBLIC (i.e., not private, not hidden)
+        'metadata.visibility': {
+          $nin: EXCLUDED_VISIBILITY_STATES // Filters out both Premium ('Private') and Hidden lessons
+        },
+
+        // 3. Privacy Control (Optional but good for security):
+        'metadata.visibility': { $ne: 'Private' }, // Assuming this targets a different kind of 'Private' setting
+
+        // 4. Similarity Logic: Match by Category OR Tone
         $or: [
           { 'lessonInfo.category': category },
           { 'lessonInfo.tone': tone },
@@ -322,45 +363,48 @@ async function run() {
       }
     });
 
+    app.get('/public-lessons', async (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
 
+    try {
+        // Define the visibility states that should NOT be visible publicly.
+        const EXCLUDED_VISIBILITY_STATES = ['Private', 'Hidden']; // Correct variable definition
 
-    // 1. CORRECTED ENDPOINT: View Count Increment
-    // app.patch('/lesson/view/:id', async (req, res) => {
-    //   try {
-    //     const lessonId = req.params.id;
-    //     const userIdentifier = getUserIdentifier(req); // Use UID or IP
+        const query = {
+            // Filter 1: Exclude lessons that are premium or hidden
+            'metadata.visibility': { 
+                // ⭐️ FIX: Corrected the typo from EXCLUDED_VISCLUDED_VISIBILITY_STATES
+                $nin: EXCLUDED_VISIBILITY_STATES 
+            },
+            
+            // Filter 2 (Optional but recommended): Ensures lessons specifically marked as private are excluded.
+            'metadata.privacy': { $ne: 'Private' }, 
+        };
 
-    //     // 1. Check if the user/IP has already viewed this lesson recently
-    //     // The 'stats.viewedBy' array stores the identifier for tracking unique views.
-    //     const lesson = await lessonsCollection.findOne(
-    //       { _id: new ObjectId(lessonId), 'stats.viewedBy': userIdentifier },
-    //       { projection: { 'stats.viewedBy': 1 } }
-    //     );
+        const publicLessons = await lessonsCollection
+            .find(query)
+            .sort({ 'metadata.createdDate': -1 }) // Sort by newest first
+            .skip(skip)
+            .limit(limit)
+            .toArray();
 
-    //     if (lesson) {
-    //       // Already viewed, do nothing.
-    //       return res.status(200).send({ success: false, message: 'View already counted' });
-    //     }
+        // Get total count for pagination metadata
+        const totalLessons = await lessonsCollection.countDocuments(query);
 
-    //     // 2. If not viewed, increment the count and add the identifier to the array
-    //     await lessonsCollection.updateOne(
-    //       { _id: new ObjectId(lessonId) },
-    //       {
-    //         $inc: { 'stats.views': 1 },
-    //         $addToSet: { 'stats.viewedBy': userIdentifier }
-    //       }
-    //     );
+        res.send({
+            lessons: publicLessons,
+            totalLessons: totalLessons,
+            currentPage: page,
+            totalPages: Math.ceil(totalLessons / limit)
+        });
 
-    //     // OPTIONAL: If using IP addresses for tracking, you might want to remove old IPs 
-    //     // periodically to reset the unique view counter over time.
-
-    //     res.send({ success: true, message: 'View count incremented' });
-
-    //   } catch (error) {
-    //     console.error("Error incrementing view count:", error);
-    //     res.status(500).send({ message: 'Failed to increment view count' });
-    //   }
-    // });
+    } catch (error) {
+        console.error("Error fetching public lessons:", error);
+        res.status(500).send({ message: 'Failed to fetch public lessons' });
+    }
+});
 
     // 2. CONFIRMED ENDPOINT: Like / Unlike Toggle
     app.post('/lesson/:id/like', verifyFirebaseToken, async (req, res) => {
@@ -723,10 +767,6 @@ async function run() {
       res.send(user);
     });
 
-
-
-
-
     app.post('/users', async (req, res) => {
       const user = req.body;
       console.log(user);
@@ -768,11 +808,6 @@ async function run() {
 
       res.send({ url: session.url });
     });
-
-
-
-
-
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
