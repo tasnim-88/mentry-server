@@ -228,6 +228,110 @@ async function run() {
       res.send(lessons);
     });
 
+    // NEW PAGINATED ROUTE: Fixes the 404 error from the client dashboard.
+    // URL: /mylessons?page=1&limit=3
+    app.get('/mylessons', verifyFirebaseToken, async (req, res) => {
+      const userUid = req.user.uid;
+      const page = parseInt(req.query.page) || 1;
+      const limit = parseInt(req.query.limit) || 10;
+      const skip = (page - 1) * limit;
+
+      try {
+        const query = { 'author.uid': userUid };
+
+        const lessons = await lessonsCollection
+          .find(query)
+          .sort({ 'metadata.createdDate': -1 }) // Sort by newest first
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        const totalLessons = await lessonsCollection.countDocuments(query);
+
+        res.send({
+          lessons: lessons,
+          totalLessons: totalLessons,
+          currentPage: page,
+          totalPages: Math.ceil(totalLessons / limit)
+        });
+
+      } catch (error) {
+        console.error("Error fetching user's lessons:", error);
+        res.status(500).send({ message: 'Failed to fetch user lessons' });
+      }
+    });
+
+    // Endpoint 1: Get Total Lessons Created by User
+    app.get('/mylessons/count', verifyFirebaseToken, async (req, res) => {
+      const userUid = req.user.uid;
+
+      try {
+        const count = await lessonsCollection.countDocuments({ 'author.uid': userUid });
+        res.send({ count });
+      } catch (error) {
+        console.error("Error fetching lesson count:", error);
+        res.status(500).send({ message: 'Failed to fetch lesson count' });
+      }
+    });
+
+    // Endpoint 2: Get Total Saved (Favorite) Lessons Count
+    app.get('/myfavorites/count', verifyFirebaseToken, async (req, res) => {
+      const userUid = req.user.uid;
+
+      try {
+        const user = await usersCollection.findOne(
+          { uid: userUid },
+          // Update the projection to match your actual database fields
+          { projection: { savedLessons: 1, favoritesArray: 1 } }
+        );
+
+        // Option A: Use the dedicated counter (fastest)
+        // Option B: Fallback to the array length if the counter isn't synced
+        const count = user?.savedLessons ?? user?.favoritesArray?.length ?? 0;
+
+        res.send({ count });
+
+      } catch (error) {
+        console.error("Error fetching favorite count:", error);
+        res.status(500).send({ message: 'Failed to fetch favorite count' });
+      }
+    });
+
+    // GET /user-activity: Contributions per day for the last 7 days
+    app.get('/user-activity', verifyFirebaseToken, async (req, res) => {
+      try {
+        const userId = req.user.uid;
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+        const activity = await lessonsCollection.aggregate([
+          {
+            $match: {
+              "author.uid": userId,
+              "metadata.createdDate": { $gte: sevenDaysAgo.toISOString() }
+            }
+          },
+          {
+            $group: {
+              _id: { $substr: ["$metadata.createdDate", 0, 10] }, // Group by YYYY-MM-DD
+              count: { $sum: 1 }
+            }
+          },
+          { $sort: { "_id": 1 } }
+        ]).toArray();
+
+        // Format for Recharts
+        const chartData = activity.map(item => ({
+          day: item._id,
+          lessons: item.count
+        }));
+
+        res.send(chartData);
+      } catch (error) {
+        res.status(500).send({ message: 'Failed to fetch activity' });
+      }
+    });
+
     app.patch('/lessons/:id', verifyFirebaseToken, async (req, res) => {
       const { id } = req.params;
       const updates = req.body;
@@ -364,47 +468,47 @@ async function run() {
     });
 
     app.get('/public-lessons', async (req, res) => {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+      const page = parseInt(req.query.page) || 1;
+      const limit = parseInt(req.query.limit) || 10;
+      const skip = (page - 1) * limit;
 
-    try {
+      try {
         // Define the visibility states that should NOT be visible publicly.
         const EXCLUDED_VISIBILITY_STATES = ['Private', 'Hidden']; // Correct variable definition
 
         const query = {
-            // Filter 1: Exclude lessons that are premium or hidden
-            'metadata.visibility': { 
-                // ⭐️ FIX: Corrected the typo from EXCLUDED_VISCLUDED_VISIBILITY_STATES
-                $nin: EXCLUDED_VISIBILITY_STATES 
-            },
-            
-            // Filter 2 (Optional but recommended): Ensures lessons specifically marked as private are excluded.
-            'metadata.privacy': { $ne: 'Private' }, 
+          // Filter 1: Exclude lessons that are premium or hidden
+          'metadata.visibility': {
+            // ⭐️ FIX: Corrected the typo from EXCLUDED_VISCLUDED_VISIBILITY_STATES
+            $nin: EXCLUDED_VISIBILITY_STATES
+          },
+
+          // Filter 2 (Optional but recommended): Ensures lessons specifically marked as private are excluded.
+          'metadata.privacy': { $ne: 'Private' },
         };
 
         const publicLessons = await lessonsCollection
-            .find(query)
-            .sort({ 'metadata.createdDate': -1 }) // Sort by newest first
-            .skip(skip)
-            .limit(limit)
-            .toArray();
+          .find(query)
+          .sort({ 'metadata.createdDate': -1 }) // Sort by newest first
+          .skip(skip)
+          .limit(limit)
+          .toArray();
 
         // Get total count for pagination metadata
         const totalLessons = await lessonsCollection.countDocuments(query);
 
         res.send({
-            lessons: publicLessons,
-            totalLessons: totalLessons,
-            currentPage: page,
-            totalPages: Math.ceil(totalLessons / limit)
+          lessons: publicLessons,
+          totalLessons: totalLessons,
+          currentPage: page,
+          totalPages: Math.ceil(totalLessons / limit)
         });
 
-    } catch (error) {
+      } catch (error) {
         console.error("Error fetching public lessons:", error);
         res.status(500).send({ message: 'Failed to fetch public lessons' });
-    }
-});
+      }
+    });
 
     // 2. CONFIRMED ENDPOINT: Like / Unlike Toggle
     app.post('/lesson/:id/like', verifyFirebaseToken, async (req, res) => {
