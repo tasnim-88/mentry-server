@@ -9,7 +9,10 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET);
 
 var admin = require("firebase-admin");
 
-var serviceAccount = require("./digital-lesson-authenti-5320e-firebase-adminsdk-fbsvc-fbcd6128cd.json");
+// var serviceAccount = require("./digital-lesson-authenti-5320e-firebase-adminsdk-fbsvc-fbcd6128cd.json");
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const serviceAccount = JSON.parse(decoded);
 
 let usersCollection;
 let lessonsCollection;
@@ -19,77 +22,87 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-// app.post(
-//   '/webhook',
-//   express.raw({ type: 'application/json' }),
-//   async (req, res) => {
-//     const sig = req.headers['stripe-signature'];
+// 1. Add this custom middleware BEFORE any other routes
+app.use(express.json({
+  verify: (req, res, buf) => {
+    // We capture the raw buffer only for the webhook endpoint
+    if (req.originalUrl.startsWith('/webhook')) {
+      req.rawBody = buf;
+    }
+  }
+}));
 
-//     let event;
-//     try {
-//       event = stripe.webhooks.constructEvent(
-//         req.body,
-//         sig,
-//         process.env.STRIPE_WEBHOOK_SECRET
-//       );
-//     } catch (err) {
-//       return res.status(400).send(`Webhook Error: ${err.message}`);
-//     }
-
-//     if (event.type === 'checkout.session.completed') {
-//       const session = event.data.object;
-
-//       await usersCollection.updateOne(
-//         { uid: session.metadata.uid },
-//         {
-//           $set: {
-//             isPremium: true,
-//             upgradedAt: new Date(),
-//           },
-//         }
-//       );
-//     }
-
-//     res.json({ received: true });
-//   }
-// );
-
-// Middleware
-
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// 2. Updated Webhook Route
+app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
 
   try {
+    // Crucial: Use req.rawBody (the buffer) instead of req.body
     event = stripe.webhooks.constructEvent(
-      req.body,
+      req.rawBody,
       sig,
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error("❌ Webhook Signature Error:", err.message);
+    // console.error("❌ Webhook Signature Error:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-
-    // Use the 'uid' you stored in metadata during session creation
     const userUid = session.metadata.uid;
 
     const updateResult = await usersCollection.updateOne(
       { uid: userUid },
-      { $set: { isPremium: true } }
+      { $set: { isPremium: true, upgradedAt: new Date() } }
     );
 
     if (updateResult.modifiedCount > 0) {
-      console.log(`✅ User ${userUid} upgraded to Premium in MongoDB`);
+      // console.log(`✅ User ${userUid} upgraded to Premium in MongoDB`);
     } else {
-      console.log(`⚠️ Payment success, but user ${userUid} not found in DB`);
+      // console.log(`⚠️ User ${userUid} not found in DB`);
     }
   }
   res.json({ received: true });
 });
+
+
+
+// app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+//   const sig = req.headers['stripe-signature'];
+//   let event;
+
+//   try {
+//     event = stripe.webhooks.constructEvent(
+//       req.body,
+//       sig,
+//       process.env.STRIPE_WEBHOOK_SECRET
+//     );
+//   } catch (err) {
+//     console.error("❌ Webhook Signature Error:", err.message);
+//     return res.status(400).send(`Webhook Error: ${err.message}`);
+//   }
+
+//   if (event.type === 'checkout.session.completed') {
+//     const session = event.data.object;
+
+//     // Use the 'uid' you stored in metadata during session creation
+//     const userUid = session.metadata.uid;
+
+//     const updateResult = await usersCollection.updateOne(
+//       { uid: userUid },
+//       { $set: { isPremium: true } }
+//     );
+
+//     if (updateResult.modifiedCount > 0) {
+//       console.log(`✅ User ${userUid} upgraded to Premium in MongoDB`);
+//     } else {
+//       console.log(`⚠️ Payment success, but user ${userUid} not found in DB`);
+//     }
+//   }
+//   res.json({ received: true });
+// });
 
 app.use(express.json())
 app.use(cors())
@@ -131,7 +144,7 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
 
     const db = client.db("mentry");
     usersCollection = db.collection("users");
@@ -143,13 +156,13 @@ async function run() {
       const email = req.user?.email;
       const user = await usersCollection.findOne({ email: email });
 
-      console.log("Checking Admin for:", email);
+      // console.log("Checking Admin for:", email);
 
       if (user && user.role === 'admin') {
-        console.log("✅ ACCESS GRANTED");
+        // console.log("✅ ACCESS GRANTED");
         next();
       } else {
-        console.log("❌ ACCESS DENIED. Role found:", user?.role);
+        // console.log("❌ ACCESS DENIED. Role found:", user?.role);
         return res.status(403).send({ message: 'forbidden access' });
       }
     };
@@ -171,11 +184,11 @@ async function run() {
     // 2. DELETE Lesson: Permanently removes a lesson by ID
     // Make sure this is BELOW your verifyAdmin definition
     app.delete('/lessons/:id', verifyFirebaseToken, verifyAdmin, async (req, res) => {
-      console.log("Inside Delete Route Logic"); // See if this logs!
+      // console.log("Inside Delete Route Logic"); // See if this logs!
       try {
         const id = req.params.id;
         const result = await lessonsCollection.deleteOne({ _id: new ObjectId(id) });
-        console.log("Delete Result:", result);
+        // console.log("Delete Result:", result);
         res.send(result);
       } catch (error) {
         console.error("Database Delete Error:", error);
@@ -320,10 +333,10 @@ async function run() {
     app.get('/users/:email/role', async (req, res) => {
       const email = req.params.email
       const query = { email }
-      console.log(email);
+      // console.log(email);
 
       const user = await usersCollection.findOne(query)
-      console.log(user);
+      // console.log(user);
 
       res.send({ role: user?.role || 'user' })
     })
@@ -1131,8 +1144,8 @@ async function run() {
     });
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
@@ -1145,5 +1158,5 @@ app.get('/', (req, res) => {
 })
 
 app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`)
+  // console.log(`Example app listening on port ${port}`)
 })
