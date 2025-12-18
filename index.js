@@ -19,42 +19,78 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-app.post(
-  '/webhook',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    const sig = req.headers['stripe-signature'];
+// app.post(
+//   '/webhook',
+//   express.raw({ type: 'application/json' }),
+//   async (req, res) => {
+//     const sig = req.headers['stripe-signature'];
 
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
+//     let event;
+//     try {
+//       event = stripe.webhooks.constructEvent(
+//         req.body,
+//         sig,
+//         process.env.STRIPE_WEBHOOK_SECRET
+//       );
+//     } catch (err) {
+//       return res.status(400).send(`Webhook Error: ${err.message}`);
+//     }
 
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
+//     if (event.type === 'checkout.session.completed') {
+//       const session = event.data.object;
 
-      await usersCollection.updateOne(
-        { uid: session.metadata.uid },
-        {
-          $set: {
-            isPremium: true,
-            upgradedAt: new Date(),
-          },
-        }
-      );
-    }
+//       await usersCollection.updateOne(
+//         { uid: session.metadata.uid },
+//         {
+//           $set: {
+//             isPremium: true,
+//             upgradedAt: new Date(),
+//           },
+//         }
+//       );
+//     }
 
-    res.json({ received: true });
-  }
-);
+//     res.json({ received: true });
+//   }
+// );
 
 // Middleware
+
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("❌ Webhook Signature Error:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+
+    // Use the 'uid' you stored in metadata during session creation
+    const userUid = session.metadata.uid;
+
+    const updateResult = await usersCollection.updateOne(
+      { uid: userUid },
+      { $set: { isPremium: true } }
+    );
+
+    if (updateResult.modifiedCount > 0) {
+      console.log(`✅ User ${userUid} upgraded to Premium in MongoDB`);
+    } else {
+      console.log(`⚠️ Payment success, but user ${userUid} not found in DB`);
+    }
+  }
+  res.json({ received: true });
+});
+
 app.use(express.json())
 app.use(cors())
 
