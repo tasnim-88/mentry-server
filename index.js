@@ -59,23 +59,26 @@ app.use(express.json())
 app.use(cors())
 
 const verifyFirebaseToken = async (req, res, next) => {
-  const token = req.headers.authorization
+  const token = req.headers.authorization;
 
   if (!token) {
-    return res.status(401).send({ message: 'Unauthorized access!' })
+    return res.status(401).send({ message: 'Unauthorized access!' });
   }
 
   try {
-    const idToken = token.split(' ')[1]
-    const decoded = await admin.auth().verifyIdToken(idToken)
+    const idToken = token.split(' ')[1];
+    const decoded = await admin.auth().verifyIdToken(idToken);
+
+    // ✅ Keep this as req.user
     req.user = decoded;
-    next()
+    next();
   }
   catch (err) {
-    return res.status(401).send({ message: 'Unauthorized access!' })
+    // This triggers if the token is expired or invalid
+    console.error("Token verification failed:", err.message);
+    return res.status(401).send({ message: 'Unauthorized access!' });
   }
-
-}
+};
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.xksrcg5.mongodb.net/?appName=Cluster0`;
 
@@ -89,7 +92,6 @@ const client = new MongoClient(uri, {
 });
 
 
-
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
@@ -101,19 +103,374 @@ async function run() {
     const lessonsReportsCollection = db.collection('lessonsReports');
     const commentsCollection = db.collection('comments');
 
-    // Lessons API
-    // app.get('/lessons', async (req, res) => {
-    //   const cursor = lessonsCollection.find();
-    //   const result = await cursor.toArray();
-    //   res.send(result);
-    // })
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.user?.email;
+      const user = await usersCollection.findOne({ email: email });
 
-    // app.get('/lessons', async (req, res) => {
-    //   const { uid } = req.query;
-    //   const query = uid ? { uid } : {};
-    //   const lessons = await lessonsCollection.find(query).toArray();
-    //   res.send(lessons);
-    // });
+      console.log("Checking Admin for:", email);
+
+      if (user && user.role === 'admin') {
+        console.log("✅ ACCESS GRANTED");
+        next();
+      } else {
+        console.log("❌ ACCESS DENIED. Role found:", user?.role);
+        return res.status(403).send({ message: 'forbidden access' });
+      }
+    };
+
+
+    // 1. GET Stats: Aggregates counts for Public, Private, and Flagged content
+    app.get('/admin/lesson-stats', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      try {
+        const publicCount = await lessonsCollection.countDocuments({ "metadata.visibility": "Public" });
+        const privateCount = await lessonsCollection.countDocuments({ "metadata.visibility": "Private" });
+        const flaggedCount = await lessonsReportsCollection.countDocuments({ status: "Pending Review" });
+
+        res.send({ publicCount, privateCount, flaggedCount });
+      } catch (error) {
+        res.status(500).send({ message: "Error fetching stats" });
+      }
+    });
+
+    // 2. DELETE Lesson: Permanently removes a lesson by ID
+    // Make sure this is BELOW your verifyAdmin definition
+    app.delete('/lessons/:id', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      console.log("Inside Delete Route Logic"); // See if this logs!
+      try {
+        const id = req.params.id;
+        const result = await lessonsCollection.deleteOne({ _id: new ObjectId(id) });
+        console.log("Delete Result:", result);
+        res.send(result);
+      } catch (error) {
+        console.error("Database Delete Error:", error);
+        res.status(500).send(error);
+      }
+    });
+
+    // 3. PATCH Lesson Status: Toggles 'featured' or marks as 'reviewed'
+    // Example Express Backend Fix
+    app.patch('/lessons/moderate/:id', async (req, res) => {
+      const id = req.params.id;
+      const updates = req.body; // This will be { isFeatured: true } or { isReviewed: true }
+
+      // Use $set to update ONLY the provided fields without touching others
+      const result = await lessonsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updates }
+      );
+      res.send(result);
+    });
+
+    // Admin Profile update
+    // Update admin profile in MongoDB
+    app.patch('/users/update-profile', verifyFirebaseToken, async (req, res) => {
+      const email = req.user.email;
+      const { displayName, photoURL } = req.body;
+
+      const filter = { email: email };
+      const updatedDoc = {
+        $set: {
+          displayName: displayName,
+          photoURL: photoURL
+        }
+      };
+
+      const result = await usersCollection.updateOne(filter, updatedDoc);
+      res.send(result);
+    });
+
+    // Users API
+    app.get('/users', async (req, res) => {
+      const cursor = usersCollection.find();
+      const result = await cursor.toArray();
+      res.send(result);
+    })
+
+    app.get('/users/me', verifyFirebaseToken, async (req, res) => {
+      const user = await usersCollection.findOne({ uid: req.user.uid });
+
+      res.send({
+        isPremium: user?.isPremium || false,
+        totalLessons: user?.totalLessons || 0,
+        savedLessons: user?.savedLessons || 0,
+      });
+    });
+
+    // UPDATE USER PROFILE (name / photo)
+    app.patch('/users/me', verifyFirebaseToken, async (req, res) => {
+      const { displayName, photoURL } = req.body;
+
+      const update = {};
+      if (displayName) update.displayName = displayName;
+      if (photoURL) update.photoURL = photoURL;
+
+      // Update users collection
+      await usersCollection.updateOne(
+        { uid: req.user.uid },
+        { $set: update },
+        { upsert: true }
+      );
+
+
+      // OPTIONAL: sync all lessons authored by user
+      await lessonsCollection.updateMany(
+        { 'author.uid': req.user.uid },
+        {
+          $set: {
+            'author.name': displayName,
+            'author.profileImage': photoURL,
+          },
+        }
+      );
+
+      res.send({ success: true });
+    });
+
+    // GET user profile by UID (e.g., for a public profile page)
+    app.get('/users/:authorUid', async (req, res) => {
+      try {
+        const authorUid = req.params.authorUid;
+
+        // 1. Fetch the user's document using the UID from the URL
+        const user = await usersCollection.findOne(
+          { uid: authorUid },
+          {
+            // Projection: Only return necessary public data
+            projection: {
+              _id: 0, // Exclude Mongo ID
+              uid: 1,
+              displayName: 1,
+              email: 1, // You might choose to hide the email
+              photoURL: 1,
+              totalLessons: 1,
+              savedLessons: 1,
+              isPremium: 1, // Useful for displaying a badge
+            },
+          }
+        );
+
+        if (!user) {
+          return res.status(404).send({ message: 'User not found' });
+        }
+
+        // You might want to filter out sensitive fields before sending
+        const publicProfile = {
+          uid: user.uid,
+          displayName: user.displayName || 'Anonymous User',
+          photoURL: user.photoURL || '',
+          totalLessons: user.totalLessons || 0,
+          savedLessons: user.savedLessons || 0,
+          isPremium: user.isPremium || false, // Display a "Premium" badge if they have it
+          // Intentionally omitting email for public view
+        };
+
+        res.send(publicProfile);
+
+      } catch (error) {
+        console.error('Error fetching user profile:', error);
+        res.status(500).send({ message: 'Failed to fetch user profile' });
+      }
+    });
+
+
+    // GET user by email
+    app.get('/users/:email', async (req, res) => {
+      const email = req.params.email;
+
+      const user = await usersCollection.findOne({ email });
+      res.send(user);
+    });
+
+    app.get('/users/:email/role', async (req, res) => {
+      const email = req.params.email
+      const query = { email }
+      console.log(email);
+
+      const user = await usersCollection.findOne(query)
+      console.log(user);
+
+      res.send({ role: user?.role || 'user' })
+    })
+
+    app.patch('/users/:id/role', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const roleInfo = req.body;
+      const query = { _id: new ObjectId(id) }
+      const updatedDoc = {
+        $set: {
+          role: roleInfo.role
+        }
+      }
+      const result = await usersCollection.updateOne(query, updatedDoc)
+      res.send(result);
+    })
+
+    app.post('/users', async (req, res) => {
+      const user = req.body;
+      const query = { email: user.email };
+
+      const updateDoc = {
+        $set: user, // Update user info if they exist
+      };
+
+      const options = { upsert: true }; // Create if they don't exist
+      const result = await usersCollection.updateOne(query, updateDoc, options);
+      res.send(result);
+    });
+
+
+    app.get('/admin-stats', async (req, res) => {
+      try {
+        // 1. KEEPING YOUR ORIGINAL STATS LOGIC
+        const totalUsers = await usersCollection.estimatedDocumentCount();
+
+        const totalLessons = await lessonsCollection.countDocuments({
+          "metadata.visibility": "Public"
+        });
+
+        const reportedLessons = await lessonsReportsCollection.estimatedDocumentCount();
+
+        const todayStr = new Date().toISOString().split('T')[0];
+        const todayNewLessons = await lessonsCollection.countDocuments({
+          "metadata.createdDate": { $regex: `^${todayStr}` }
+        });
+
+        // 2. ADDING ONLY THE CHART AGGREGATION (THE FIX)
+        const lessonGrowth = await lessonsCollection.aggregate([
+          {
+            $project: {
+              // Extracts YYYY-MM-DD from your metadata.createdDate strings
+              shortDate: { $substr: ["$metadata.createdDate", 0, 10] }
+            }
+          },
+          {
+            $group: {
+              _id: "$shortDate",
+              count: { $sum: 1 }
+            }
+          },
+          { $sort: { "_id": 1 } },
+          {
+            $project: {
+              _id: 0,
+              date: "$_id",
+              newLessons: "$count",
+              newUsers: { $literal: 0 } // Placeholder for user growth
+            }
+          },
+          { $limit: 30 }
+        ]).toArray();
+
+        // 3. KEEPING YOUR ORIGINAL CONTRIBUTORS LOGIC
+        const activeContributors = await usersCollection
+          .find()
+          .sort({ lessonCount: -1 })
+          .limit(5)
+          .toArray();
+
+        // 4. SENDING THE MERGED DATA
+        res.send({
+          stats: {
+            totalUsers,
+            totalLessons,
+            reportedLessons,
+            todayNewLessons
+          },
+          chartData: lessonGrowth, // This now populates your charts
+          activeContributors
+        });
+
+      } catch (error) {
+        console.error("Stats Error:", error);
+        res.status(500).send("Server Error");
+      }
+    });
+
+    app.post('/create-checkout-session', verifyFirebaseToken, async (req, res) => {
+
+      const user = await usersCollection.findOne({ uid: req.user.uid });
+
+      if (user?.isPremium) {
+        return res.status(400).send({
+          message: 'User already has Premium access',
+        });
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ['card'],
+        mode: 'payment',
+        customer_email: req.user.email,
+        line_items: [
+          {
+            price_data: {
+              currency: 'bdt',
+              product_data: { name: 'Premium Lifetime Access' },
+              unit_amount: 1500 * 100,
+            },
+            quantity: 1,
+          },
+        ],
+        success_url: `${process.env.SITE_DOMAIN}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.SITE_DOMAIN}/payment/cancel`,
+        metadata: {
+          uid: req.user.uid,
+        },
+      });
+
+      res.send({ url: session.url });
+    });
+
+
+    // Reported lessons
+
+    // Get aggregated reported lessons
+    app.get('/admin/reported-lessons', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: "$lessonId",
+            reportCount: { $sum: 1 },
+            latestReportDate: { $max: "$timestamp" },
+            reports: { $push: "$$ROOT" } // Keep all report details for the modal
+          }
+        },
+        {
+          $lookup: {
+            from: "lessons",
+            localField: "_id",
+            foreignField: "_id",
+            as: "lessonDetails"
+          }
+        },
+        { $unwind: "$lessonDetails" },
+        {
+          $project: {
+            lessonId: "$_id",
+            reportCount: 1,
+            latestReportDate: 1,
+            reports: 1,
+            title: "$lessonDetails.lessonInfo.title",
+            author: "$lessonDetails.author.name",
+            status: { $arrayElemAt: ["$reports.status", 0] } // Assuming status is synced
+          }
+        }
+      ];
+
+      const result = await lessonsReportsCollection.aggregate(pipeline).toArray();
+      res.send(result);
+    });
+
+    // Action: Ignore (Update all reports for a lesson to "Resolved/Ignored")
+    app.patch('/admin/ignore-reports/:lessonId', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      const lessonId = req.params.lessonId;
+      const result = await lessonsReportsCollection.updateMany(
+        { lessonId: new ObjectId(lessonId) },
+        { $set: { status: "Ignored" } }
+      );
+      res.send(result);
+    });
+
+    // Lessons Api
 
     app.get('/lessons', async (req, res) => {
       try {
@@ -390,39 +747,6 @@ async function run() {
 
       res.send({ success: true });
     });
-
-
-    // GET similar lessons
-    // app.get('/similar-lessons/:id', async (req, res) => {
-    //   const currentLessonId = req.params.id;
-    //   const { category, tone } = req.query; // Expect category and tone as query params
-
-    //   if (!category && !tone) {
-    //     return res.send([]); // Return empty if no criteria provided
-    //   }
-
-    //   const query = {
-    //     _id: { $ne: new ObjectId(currentLessonId) }, // Exclude the current lesson
-    //     'metadata.privacy': { $ne: 'Private' },
-    //     'metadata.visibility': { $ne: 'Hidden' },
-    //     $or: [
-    //       { 'lessonInfo.category': category },
-    //       { 'lessonInfo.tone': tone },
-    //     ],
-    //   };
-
-    //   try {
-    //     const similarLessons = await lessonsCollection
-    //       .find(query)
-    //       .limit(6) // Display at most 6 cards
-    //       .toArray();
-
-    //     res.send(similarLessons);
-    //   } catch (error) {
-    //     console.error("Error fetching similar lessons:", error);
-    //     res.status(500).send({ message: 'Failed to fetch similar lessons' });
-    //   }
-    // });
 
     app.get('/similar-lessons/:id', async (req, res) => {
       const currentLessonId = req.params.id;
@@ -768,149 +1092,6 @@ async function run() {
         console.error("Error posting comment:", error);
         res.status(500).send({ message: 'Internal server error while posting comment.' });
       }
-    });
-
-    // Users API
-    app.get('/users', async (req, res) => {
-      const cursor = usersCollection.find();
-      const result = await cursor.toArray();
-      res.send(result);
-    })
-
-    app.get('/users/me', verifyFirebaseToken, async (req, res) => {
-      const user = await usersCollection.findOne({ uid: req.user.uid });
-
-      res.send({
-        isPremium: user?.isPremium || false,
-        totalLessons: user?.totalLessons || 0,
-        savedLessons: user?.savedLessons || 0,
-      });
-    });
-
-    // UPDATE USER PROFILE (name / photo)
-    app.patch('/users/me', verifyFirebaseToken, async (req, res) => {
-      const { displayName, photoURL } = req.body;
-
-      const update = {};
-      if (displayName) update.displayName = displayName;
-      if (photoURL) update.photoURL = photoURL;
-
-      // Update users collection
-      await usersCollection.updateOne(
-        { uid: req.user.uid },
-        { $set: update },
-        { upsert: true }
-      );
-
-
-      // OPTIONAL: sync all lessons authored by user
-      await lessonsCollection.updateMany(
-        { 'author.uid': req.user.uid },
-        {
-          $set: {
-            'author.name': displayName,
-            'author.profileImage': photoURL,
-          },
-        }
-      );
-
-      res.send({ success: true });
-    });
-
-    // GET user profile by UID (e.g., for a public profile page)
-    app.get('/users/:authorUid', async (req, res) => {
-      try {
-        const authorUid = req.params.authorUid;
-
-        // 1. Fetch the user's document using the UID from the URL
-        const user = await usersCollection.findOne(
-          { uid: authorUid },
-          {
-            // Projection: Only return necessary public data
-            projection: {
-              _id: 0, // Exclude Mongo ID
-              uid: 1,
-              displayName: 1,
-              email: 1, // You might choose to hide the email
-              photoURL: 1,
-              totalLessons: 1,
-              savedLessons: 1,
-              isPremium: 1, // Useful for displaying a badge
-            },
-          }
-        );
-
-        if (!user) {
-          return res.status(404).send({ message: 'User not found' });
-        }
-
-        // You might want to filter out sensitive fields before sending
-        const publicProfile = {
-          uid: user.uid,
-          displayName: user.displayName || 'Anonymous User',
-          photoURL: user.photoURL || '',
-          totalLessons: user.totalLessons || 0,
-          savedLessons: user.savedLessons || 0,
-          isPremium: user.isPremium || false, // Display a "Premium" badge if they have it
-          // Intentionally omitting email for public view
-        };
-
-        res.send(publicProfile);
-
-      } catch (error) {
-        console.error('Error fetching user profile:', error);
-        res.status(500).send({ message: 'Failed to fetch user profile' });
-      }
-    });
-
-
-    // GET user by email
-    app.get('/users/:email', async (req, res) => {
-      const email = req.params.email;
-      const user = await usersCollection.findOne({ email });
-      res.send(user);
-    });
-
-    app.post('/users', async (req, res) => {
-      const user = req.body;
-      console.log(user);
-      const result = await usersCollection.insertOne(user);
-      res.send(result);
-    })
-
-    // Payment Intent API
-    app.post('/create-checkout-session', verifyFirebaseToken, async (req, res) => {
-
-      const user = await usersCollection.findOne({ uid: req.user.uid });
-
-      if (user?.isPremium) {
-        return res.status(400).send({
-          message: 'User already has Premium access',
-        });
-      }
-
-      const session = await stripe.checkout.sessions.create({
-        payment_method_types: ['card'],
-        mode: 'payment',
-        customer_email: req.user.email,
-        line_items: [
-          {
-            price_data: {
-              currency: 'bdt',
-              product_data: { name: 'Premium Lifetime Access' },
-              unit_amount: 1500 * 100,
-            },
-            quantity: 1,
-          },
-        ],
-        success_url: `${process.env.SITE_DOMAIN}/payment/success`,
-        cancel_url: `${process.env.SITE_DOMAIN}/payment/cancel`,
-        metadata: {
-          uid: req.user.uid,
-        },
-      });
-
-      res.send({ url: session.url });
     });
 
     // Send a ping to confirm a successful connection
